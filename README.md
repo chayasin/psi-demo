@@ -80,3 +80,53 @@ python bob.py
 # Terminal 2
 python alice.py
 ```
+
+## Mathematical Details
+
+### 1. ECDH PSI (Private Set Intersection)
+This protocol relies on the **commutative property** of scalar multiplication on Elliptic Curves.
+
+Let $G$ be a generator point on an elliptic curve $E$.
+Let $a$ be Alice's private key (a random scalar).
+Let $b$ be Bob's private key (a random scalar).
+Let $H(x)$ be a hash function that maps an input $x$ to a point on the curve.
+
+1.  **Alice** computes $P_a = a \cdot H(x)$ for each item $x$ in her set.
+2.  **Bob** receives $P_a$ and computes $P_{ab} = b \cdot P_a = b \cdot (a \cdot H(x))$.
+    *   Due to associativity/commutativity: $b \cdot a \cdot H(x) = (ab) \cdot H(x)$.
+3.  **Bob** computes $P_b = b \cdot H(y)$ for each item $y$ in his set.
+4.  **Alice** receives $P_b$ and computes $P_{ba} = a \cdot P_b = a \cdot (b \cdot H(y))$.
+    *   Similarly: $a \cdot b \cdot H(y) = (ab) \cdot H(y)$.
+
+**Conclusion**: If Alice has item $x$ and Bob has item $y$, and $x = y$, then:
+$$P_{ab} = (ab) \cdot H(x) = (ab) \cdot H(y) = P_{ba}$$
+Alice can simply check if any of her double-blinded points ($P_{ab}$) match any of the double-blinded points she computed from Bob ($P_{ba}$).
+
+### 2. Paillier Homomorphic Encryption (Secure Aggregation)
+The Paillier cryptosystem is an additive homomorphic encryption scheme.
+
+Let $n = p \cdot q$ be the product of two large primes.
+Let $g$ be a generator.
+Public Key: $(n, g)$. Private Key: $(\lambda, \mu)$.
+
+**Encryption**:
+To encrypt a message $m$ with random $r$:
+$$c = g^m \cdot r^n \mod n^2$$
+
+**Homomorphic Addition**:
+Given two ciphertexts $c_1 = E(m_1)$ and $c_2 = E(m_2)$:
+$$c_1 \cdot c_2 = (g^{m_1} r_1^n) \cdot (g^{m_2} r_2^n) = g^{m_1+m_2} (r_1 r_2)^n \mod n^2$$
+$$c_1 \cdot c_2 = E(m_1 + m_2)$$
+*Multiplying ciphertexts results in the encryption of the sum of the plaintexts.*
+
+**Homomorphic Multiplication by Scalar**:
+Given ciphertext $c = E(m)$ and a scalar $k$:
+$$c^k = (g^m r^n)^k = g^{mk} (r^k)^n \mod n^2$$
+$$c^k = E(m \cdot k)$$
+*Raising a ciphertext to a scalar power results in the encryption of the product.*
+
+**In our Scenario**:
+Alice sends $c_{salary} = E(Salary)$.
+Bob computes $c_{total} = c_{salary} \cdot E(Bonus) = E(Salary + Bonus)$.
+Bob sums these up for the department: $C_{final} = \prod c_{total_i} = E(\sum (Salary_i + Bonus_i))$.
+Alice decrypts $C_{final}$ to get the total compensation.
