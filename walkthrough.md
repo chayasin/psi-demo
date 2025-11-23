@@ -98,8 +98,12 @@ sequenceDiagram
     A->>A: Join with Local Data (Name, Salary)
     Note right of A: Joined DataFrame
 
-    Note over A, B: Scenario 3: Aggregation
-    A->>A: Group By Department
-    A->>A: Sum (Salary + Bonus)
-    Note right of A: Final Aggregated Result
+    Note over A, B: Scenario 3: Secure Aggregation (Paillier HE)
+    A->>A: Encrypt Salaries: Enc(S)
+    A->>B: Send Enc(S) for Intersection
+    B->>B: Homomorphic Add: Enc(S) + Bonus
+    B->>B: Group & Sum Encrypted Totals
+    B->>A: Send Encrypted Group Sums
+    A->>A: Decrypt Totals
+    Note right of A: Final Result (No raw data shared)
 ```

@@ -76,13 +76,34 @@ if st.session_state.connected:
 
     # Scenario 3
     st.subheader("Scenario 3: Aggregation")
-    if st.button("Run Aggregation"):
-        agg = st.session_state.client.run_aggregation()
-        if agg is not None:
-            st.success("Aggregation Complete!")
-            st.dataframe(agg)
-        else:
-            st.error("Aggregation Failed. Run Join first.")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("Run Aggregation (Insecure)"):
+            agg = st.session_state.client.run_aggregation()
+            if agg is not None:
+                st.success("Aggregation Complete!")
+                st.dataframe(agg)
+            else:
+                st.error("Aggregation Failed. Run Join first.")
+
+    with col2:
+        if st.button("Run Secure Aggregation (HE)"):
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            def update_progress(p):
+                progress_bar.progress(p)
+                status_text.text(f"Progress: {int(p*100)}%")
+                
+            with st.spinner("Running Secure Aggregation..."):
+                agg = st.session_state.client.run_secure_aggregation(progress_callback=update_progress)
+            
+            if agg is not None:
+                st.success("Secure Aggregation Complete!")
+                st.dataframe(agg)
+            else:
+                st.error("Secure Aggregation Failed. Run PSI first.")
 
 # Logs
 st.header("Logs")

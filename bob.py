@@ -6,6 +6,7 @@ import network_utils
 from tqdm import tqdm
 import threading
 import time
+import phe.paillier as paillier
 
 class BobServer:
     def __init__(self, host='0.0.0.0', port=5000):
@@ -106,6 +107,57 @@ class BobServer:
                     joined_data = self.df_bob[mask].to_dict('records')
                     network_utils.send_msg(conn, {"data": joined_data})
                     self.log(f"Sent {len(joined_data)} records to {addr}")
+
+                elif command == "SECURE_AGGREGATION":
+                    self.log(f"SECURE_AGGREGATION Request from {addr}")
+                    # Receive public key and encrypted data
+                    pub_key_data = msg.get("public_key")
+                    public_key = paillier.PaillierPublicKey(n=pub_key_data['n'])
+                    
+                    encrypted_salaries_data = msg.get("encrypted_salaries")
+                    # Reconstruct EncryptedNumber objects
+                    encrypted_salaries = {}
+                    for uid, enc_val in encrypted_salaries_data.items():
+                        encrypted_salaries[uid] = paillier.EncryptedNumber(public_key, int(enc_val))
+                    
+                    self.log(f"Received {len(encrypted_salaries)} encrypted salaries.")
+                    
+                    # Perform Homomorphic Addition: Enc(Salary) + Bonus
+                    # We need to match IDs.
+                    # df_bob has ID, Department, Bonus
+                    
+                    # Filter Bob's data to only those in the encrypted list
+                    mask = self.df_bob["ID"].isin(encrypted_salaries.keys())
+                    bob_subset = self.df_bob[mask]
+                    
+                    # Group by Department
+                    grouped_sums = {} # Department -> EncryptedSum
+                    
+                    count = 0
+                    for index, row in bob_subset.iterrows():
+                        uid = row["ID"]
+                        department = row["Department"]
+                        bonus = row["Bonus"]
+                        
+                        if uid in encrypted_salaries:
+                            enc_salary = encrypted_salaries[uid]
+                            # Homomorphic Addition: Enc(Salary) + Bonus
+                            enc_total = enc_salary + bonus
+                            
+                            if department not in grouped_sums:
+                                grouped_sums[department] = enc_total
+                            else:
+                                grouped_sums[department] = grouped_sums[department] + enc_total
+                            count += 1
+                            
+                    self.log(f"Aggregated {count} records into {len(grouped_sums)} departments.")
+                    
+                    # Serialize results
+                    # We send back the ciphertext (integer)
+                    serialized_results = {dept: str(enc_sum.ciphertext()) for dept, enc_sum in grouped_sums.items()}
+                    
+                    network_utils.send_msg(conn, {"results": serialized_results})
+                    self.log("Sent aggregated results to Alice.")
                     
                 elif command == "EXIT":
                     self.log(f"Client {addr} disconnected.")

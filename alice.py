@@ -5,6 +5,7 @@ from data_generator import generate_data
 import network_utils
 from tqdm import tqdm
 import time
+import phe.paillier as paillier
 
 class AliceClient:
     def __init__(self, host='127.0.0.1', port=5000):
@@ -116,6 +117,79 @@ class AliceClient:
         self.log("Aggregating data...")
         self.joined_data["TotalComp"] = self.joined_data["Salary"] + self.joined_data["Bonus"]
         self.aggregated_data = self.joined_data.groupby("Department")["TotalComp"].sum().reset_index()
+        return self.aggregated_data
+
+    def run_secure_aggregation(self, progress_callback=None):
+        if not self.socket or not self.intersection_ids:
+            self.log("Cannot run secure aggregation: No connection or no intersection.")
+            return None
+
+        self.log("Starting Secure Aggregation (Paillier HE)...")
+        
+        # 1. Generate Keys
+        self.log("Generating Paillier Keys...")
+        public_key, private_key = paillier.generate_paillier_keypair()
+        
+        # 2. Encrypt Salaries for Intersection
+        self.log("Encrypting Salaries...")
+        # We need to map ID -> Salary
+        # df_alice has ID, Name, Age, Salary
+        alice_subset = self.df_alice[self.df_alice["ID"].isin(self.intersection_ids)]
+        
+        encrypted_salaries = {}
+        total = len(alice_subset)
+        count = 0
+        
+        for index, row in alice_subset.iterrows():
+            uid = row["ID"]
+            salary = row["Salary"]
+            # Encrypt
+            enc_salary = public_key.encrypt(salary)
+            # Store ciphertext (integer) for sending? 
+            # Actually, we can send the ciphertext as string or int.
+            # phe EncryptedNumber has .ciphertext() method which returns int.
+            encrypted_salaries[uid] = str(enc_salary.ciphertext())
+            
+            count += 1
+            if progress_callback and count % 10 == 0:
+                progress_callback(count / total * 0.5) # First 50%
+                
+        if progress_callback: progress_callback(0.5)
+        
+        # 3. Send to Bob
+        self.log("Sending Encrypted Data to Bob...")
+        payload = {
+            "command": "SECURE_AGGREGATION",
+            "public_key": {'n': public_key.n},
+            "encrypted_salaries": encrypted_salaries
+        }
+        network_utils.send_msg(self.socket, payload)
+        
+        # 4. Receive Results
+        self.log("Waiting for Bob's Aggregation...")
+        msg = network_utils.recv_msg(self.socket)
+        serialized_results = msg["results"]
+        
+        # 5. Decrypt
+        self.log("Decrypting Results...")
+        decrypted_results = []
+        
+        total_depts = len(serialized_results)
+        count = 0
+        
+        for dept, enc_sum_str in serialized_results.items():
+            enc_sum = paillier.EncryptedNumber(public_key, int(enc_sum_str))
+            decrypted_total = private_key.decrypt(enc_sum)
+            decrypted_results.append({"Department": dept, "TotalComp": decrypted_total})
+            
+            count += 1
+            if progress_callback:
+                progress_callback(0.5 + (count / total_depts * 0.5))
+                
+        if progress_callback: progress_callback(1.0)
+        
+        self.aggregated_data = pd.DataFrame(decrypted_results)
+        self.log("Secure Aggregation Complete.")
         return self.aggregated_data
 
     def close(self):
