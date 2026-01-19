@@ -1,11 +1,11 @@
 import socket
 import pandas as pd
-from psi_protocol import PSIProtocol
+from psi_protocol import PSIProtocol, SecureAggregator
 from data_generator import generate_data
 import network_utils
 from tqdm import tqdm
 import time
-import phe.paillier as paillier
+import tenseal as ts
 
 class AliceClient:
     def __init__(self, host='127.0.0.1', port=5000):
@@ -47,16 +47,19 @@ class AliceClient:
             self.log("Not connected.")
             return None
 
-        self.log("Starting PSI Protocol...")
+        self.log("Starting PSI Protocol (Optimized Cryptography)...")
         alice_ids = self.df_alice["ID"].tolist()
         
-        # 1. Blind Items
-        alice_points = []
+        # 1. Blind Items (H(x)^a)
+        # Note: In optimized protocol, this is ECDH half-step: a * H(x)
+        alice_blinded = []
         total = len(alice_ids)
         for i, uid in enumerate(alice_ids):
-            pt = self.psi.hash_to_point(uid)
-            blinded = self.psi.blind_point(pt)
-            alice_points.append(blinded)
+            # Map to curve
+            pt = self.psi.hash_to_curve_public_key(uid)
+            # Apply private key (ECDH) -> returns x-coord bytes
+            blinded = self.psi.apply_private_key(pt)
+            alice_blinded.append(blinded)
             if progress_callback and i % 10 == 0:
                 progress_callback(i / total)
         
@@ -64,30 +67,39 @@ class AliceClient:
 
         # 2. Send to Bob
         self.log("Sending blinded items to Bob...")
-        network_utils.send_msg(self.socket, {"command": "PSI", "points": alice_points})
+        network_utils.send_msg(self.socket, {"command": "PSI", "points": alice_blinded})
         
-        # 3. Receive A^b
+        # 3. Receive A^b (Alice's items blinded by Bob)
         self.log("Waiting for Bob's response...")
         msg = network_utils.recv_msg(self.socket)
         alice_blinded_by_bob = msg["points"]
         
-        # 4. Receive B
+        # 4. Receive B^b (Bob's items blinded by Bob)
+        # Bob calculates H(y)^b and sends it.
+        # Actually Bob sends H(y)^b. Alice computes (H(y)^b)^a.
         msg = network_utils.recv_msg(self.socket)
         bob_blinded = msg["points"]
         
-        # 5. Compute B^a
+        # 5. Compute B^ba = (H(y)^b)^a
         self.log("Computing final intersection...")
-        bob_blinded_by_alice = [self.psi.blind_point(p) for p in bob_blinded]
+        bob_blinded_by_alice = []
+        for p in bob_blinded:
+            # p is x-coord bytes from Bob.
+            # We treat it as public key and apply 'a'.
+            val = self.psi.apply_private_key(p)
+            bob_blinded_by_alice.append(val)
         
         # 6. Intersect
-        bob_set = set()
-        for p in bob_blinded_by_alice:
-            bob_set.add(self.psi.serialize_point(p))
+        # Intersection is where A^ab == B^ba ?
+        # Alice sent A^a. Bob returned (A^a)^b = A^ab.
+        # Bob sent B^b. Alice computed (B^b)^a = B^ba.
+        # If A=B, then A^ab == B^ba (commutativity).
+        
+        bob_set = set(bob_blinded_by_alice)
             
         self.intersection_ids = []
-        for i, p in enumerate(alice_blinded_by_bob):
-            serialized = self.psi.serialize_point(p)
-            if serialized in bob_set:
+        for i, val in enumerate(alice_blinded_by_bob):
+            if val in bob_set:
                 self.intersection_ids.append(alice_ids[i])
         
         self.log(f"Intersection found: {len(self.intersection_ids)} items.")
@@ -106,7 +118,11 @@ class AliceClient:
         self.log(f"Received {len(bob_data)} records from Bob.")
         
         df_bob_data = pd.DataFrame(bob_data)
-        self.joined_data = pd.merge(self.df_alice, df_bob_data, on="ID")
+        if not df_bob_data.empty:
+            self.joined_data = pd.merge(self.df_alice, df_bob_data, on="ID")
+        else:
+             self.joined_data = self.df_alice[self.df_alice["ID"].isin(self.intersection_ids)]
+             
         return self.joined_data
 
     def run_aggregation(self):
@@ -124,70 +140,49 @@ class AliceClient:
             self.log("Cannot run secure aggregation: No connection or no intersection.")
             return None
 
-        self.log("Starting Secure Aggregation (Paillier HE)...")
+        self.log("Starting Secure Aggregation (TenSEAL CKKS)...")
         
-        # 1. Generate Keys
-        self.log("Generating Paillier Keys...")
-        public_key, private_key = paillier.generate_paillier_keypair()
+        # 1. Generate Context
+        context = SecureAggregator.create_context()
         
-        # 2. Encrypt Salaries for Intersection
-        self.log("Encrypting Salaries...")
-        # We need to map ID -> Salary
-        # df_alice has ID, Name, Age, Salary
-        alice_subset = self.df_alice[self.df_alice["ID"].isin(self.intersection_ids)]
+        # 2. Prepare Data
+        # Sort IDs to ensure alignment
+        sorted_ids = sorted(self.intersection_ids)
+        alice_subset = self.df_alice[self.df_alice["ID"].isin(sorted_ids)].set_index("ID")
+        alice_subset = alice_subset.reindex(sorted_ids)
+        salaries = alice_subset["Salary"].tolist()
         
-        encrypted_salaries = {}
-        total = len(alice_subset)
-        count = 0
+        # 3. Encrypt Vector
+        self.log(f"Encrypting {len(salaries)} salaries...")
+        enc_salaries = SecureAggregator.encrypt_vector(context, salaries)
         
-        for index, row in alice_subset.iterrows():
-            uid = row["ID"]
-            salary = row["Salary"]
-            # Encrypt
-            enc_salary = public_key.encrypt(salary)
-            # Store ciphertext (integer) for sending? 
-            # Actually, we can send the ciphertext as string or int.
-            # phe EncryptedNumber has .ciphertext() method which returns int.
-            encrypted_salaries[uid] = str(enc_salary.ciphertext())
-            
-            count += 1
-            if progress_callback and count % 10 == 0:
-                progress_callback(count / total * 0.5) # First 50%
-                
-        if progress_callback: progress_callback(0.5)
-        
-        # 3. Send to Bob
-        self.log("Sending Encrypted Data to Bob...")
+        # 4. Send to Bob
+        self.log("Sending Encrypted Vectors to Bob...")
         payload = {
             "command": "SECURE_AGGREGATION",
-            "public_key": {'n': public_key.n},
-            "encrypted_salaries": encrypted_salaries
+            "context": context.serialize(save_secret_key=False),
+            "enc_salaries": enc_salaries.serialize(),
+            "ids": sorted_ids # Necessary for alignment
         }
         network_utils.send_msg(self.socket, payload)
         
-        # 4. Receive Results
+        # 5. Receive Results
         self.log("Waiting for Bob's Aggregation...")
         msg = network_utils.recv_msg(self.socket)
         serialized_results = msg["results"]
         
-        # 5. Decrypt
+        # 6. Decrypt
         self.log("Decrypting Results...")
         decrypted_results = []
         
-        total_depts = len(serialized_results)
-        count = 0
-        
-        for dept, enc_sum_str in serialized_results.items():
-            enc_sum = paillier.EncryptedNumber(public_key, int(enc_sum_str))
-            decrypted_total = private_key.decrypt(enc_sum)
-            decrypted_results.append({"Department": dept, "TotalComp": decrypted_total})
+        for dept, enc_sum_bytes in serialized_results.items():
+            enc_sum = ts.ckks_vector_from(context, enc_sum_bytes)
+            # Decrypt returns a list (vector). Since we summed to a single value (conceptually)
+            # Or if Bob summed by mask, the result likely has the sum in the first slot or as a single element vector?
+            # If Bob did 'sum()', it returns a CKKSVector with 1 element.
+            val = enc_sum.decrypt()[0]
+            decrypted_results.append({"Department": dept, "TotalComp": val})
             
-            count += 1
-            if progress_callback:
-                progress_callback(0.5 + (count / total_depts * 0.5))
-                
-        if progress_callback: progress_callback(1.0)
-        
         self.aggregated_data = pd.DataFrame(decrypted_results)
         self.log("Secure Aggregation Complete.")
         return self.aggregated_data

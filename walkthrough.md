@@ -70,8 +70,9 @@ Alice aggregates the joined data.
 - Sum `Salary + Bonus`.
 
 ## Notes
-- The cryptographic operations are implemented in pure Python for portability, so processing 1000 items takes about 1 minute.
-- For production, use a C++ backend or optimized library (e.g., `libsodium` bindings).
+- The cryptographic operations use `cryptography` (OpenSSL bindings) and `tenseal` (OpenMined CKKS) for high performance.
+- Processing is now significantly faster due to C++ backends.
+- `openmined-psi` is recommended if available, but `cryptography` provides an optimized fallback for standard ECDH PSI.
 
 ## Protocol Diagram
 
@@ -80,15 +81,15 @@ sequenceDiagram
     participant A as Alice (Client)
     participant B as Bob (Server)
     
-    Note over A, B: Scenario 1: Basic Intersection (ECDH PSI)
-    A->>A: Hash & Blind Items: H(x)^a
-    A->>B: Send H(x)^a
-    B->>B: Blind Alice's Items: (H(x)^a)^b = H(x)^ab
-    B->>A: Send H(x)^ab
-    B->>B: Hash & Blind Own Items: H(y)^b
-    B->>A: Send H(y)^b
-    A->>A: Blind Bob's Items: (H(y)^b)^a = H(y)^ba
-    A->>A: Compare {H(x)^ab} and {H(y)^ba}
+    Note over A, B: Scenario 1: Basic Intersection (Optimized ECDH PSI)
+    A->>A: Hash & Blind Items: x' = a * H(x)
+    A->>B: Send x'
+    B->>B: Blind Alice's Items: x'' = b * x'
+    B->>A: Send x''
+    B->>B: Hash & Blind Own Items: y' = b * H(y)
+    B->>A: Send y'
+    A->>A: Blind Bob's Items: y'' = a * y'
+    A->>A: Compare {x''} and {y''}
     Note right of A: Intersection Found (IDs)
 
     Note over A, B: Scenario 2: Join Data
@@ -98,11 +99,12 @@ sequenceDiagram
     A->>A: Join with Local Data (Name, Salary)
     Note right of A: Joined DataFrame
 
-    Note over A, B: Scenario 3: Secure Aggregation (Paillier HE)
-    A->>A: Encrypt Salaries: Enc(S)
-    A->>B: Send Enc(S) for Intersection
+    Note over A, B: Scenario 3: Secure Aggregation (TenSEAL CKKS)
+    A->>A: Encrypt Salary Vector: Enc(S)
+    A->>B: Send Enc(S) + Context
+    B->>B: Prepare Bonus Vector (aligned)
     B->>B: Homomorphic Add: Enc(S) + Bonus
-    B->>B: Group & Sum Encrypted Totals
+    B->>B: Group & Sum Encrypted Totals per Dept
     B->>A: Send Encrypted Group Sums
     A->>A: Decrypt Totals
     Note right of A: Final Result (No raw data shared)

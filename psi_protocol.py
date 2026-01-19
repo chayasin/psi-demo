@@ -1,104 +1,104 @@
 import hashlib
-import random
 import pickle
+import tenseal as ts
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import serialization
 
-# SECP256R1 Parameters
+# SECP256R1 Curve Parameters (for manual point reconstruction)
 P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffff
-A = 0xffffffff00000001000000000000000000000000fffffffffffffffffffffffc
+A = -3
 B = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b
-Gx = 0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296
-Gy = 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5
-N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
-
-class Point:
-    def __init__(self, x, y, infinity=False):
-        self.x = x
-        self.y = y
-        self.infinity = infinity
-
-    def __eq__(self, other):
-        if self.infinity: return other.infinity
-        if other.infinity: return False
-        return self.x == other.x and self.y == other.y
-
-    def __repr__(self):
-        if self.infinity: return "Point(Infinity)"
-        return f"Point({hex(self.x)}, {hex(self.y)})"
-
-def inverse_mod(k, p):
-    if k == 0:
-        raise ZeroDivisionError('division by zero')
-    if k < 0:
-        return p - inverse_mod(-k, p)
-    s, old_s = 0, 1
-    t, old_t = 1, 0
-    r, old_r = p, k
-    while r != 0:
-        quotient = old_r // r
-        old_r, r = r, old_r - quotient * r
-        old_s, s = s, old_s - quotient * s
-        old_t, t = t, old_t - quotient * t
-    return old_s % p
-
-def point_add(p1, p2):
-    if p1.infinity: return p2
-    if p2.infinity: return p1
-    if p1.x == p2.x and p1.y != p2.y:
-        return Point(0, 0, True)
-    
-    if p1.x == p2.x:
-        m = (3 * p1.x**2 + A) * inverse_mod(2 * p1.y, P)
-    else:
-        m = (p1.y - p2.y) * inverse_mod(p1.x - p2.x, P)
-    
-    m = m % P
-    x3 = (m**2 - p1.x - p2.x) % P
-    y3 = (m*(p1.x - x3) - p1.y) % P
-    return Point(x3, y3)
-
-def point_mul(p1, d):
-    if p1.infinity: return p1
-    res = Point(0, 0, True)
-    temp = p1
-    while d > 0:
-        if d % 2 == 1:
-            res = point_add(res, temp)
-        temp = point_add(temp, temp)
-        d //= 2
-    return res
 
 class PSIProtocol:
     def __init__(self):
-        self.private_key = random.randint(1, N-1)
-    
-    def hash_to_point(self, data: str) -> Point:
-        """
-        Maps a string to a point on the curve.
-        Uses a simple 'try-and-increment' or just multiplies Generator by hash.
-        Multiplying G by hash is NOT secure for OPRF but for simple ECDH PSI it works 
-        IF we assume H(x) acts as a random oracle mapping to the group.
-        
-        However, H(x)*G implies we know the discrete log of the point (it's H(x)).
-        If Alice sends H(x)*G, Bob knows H(x)*G.
-        Bob can brute force x if the space is small?
-        Yes, if Bob can guess x, he can compute H(x)*G and check.
-        This is true for any PSI.
-        
-        So H(x)*G is fine.
-        """
-        digest = hashlib.sha256(data.encode('utf-8')).digest()
-        scalar = int.from_bytes(digest, 'big') % N
-        return point_mul(Point(Gx, Gy), scalar)
+        self.curve = ec.SECP256R1()
+        self.private_key = ec.generate_private_key(self.curve)
 
-    def blind_point(self, point: Point) -> Point:
+    def hash_to_curve_public_key(self, data: str) -> ec.EllipticCurvePublicKey:
         """
-        Blinds a point P with the private key.
-        Returns P * private_key.
+        Maps a string to a PublicKey on the curve. This is effectively H(x) * G.
         """
-        return point_mul(point, self.private_key)
+        digest = hashes.Hash(hashes.SHA256())
+        digest.update(data.encode('utf-8'))
+        h = digest.finalize()
+        scalar = int.from_bytes(h, 'big') 
+        # Modulo group order isn't strictly necessary for `derive` but good practice
+        # However deriving from a huge scalar is handled by cryptography logic usually.
+        # But to be safe, let's keep it raw (cryptography handles valid range or error).
+        # Actually `derive_private_key` expects integer. 
+        # For P-256 scalar must be < Order.
+        # Let's simple mod P (approximation of order for now, or just use large enough?)
+        # Order N is close to P.
+        N = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551
+        scalar = scalar % N
+        return ec.derive_private_key(scalar, self.curve, default_backend()).public_key()
     
-    def serialize_point(self, point: Point) -> bytes:
-        return pickle.dumps(point)
-    
-    def deserialize_point(self, data: bytes) -> Point:
+    def apply_private_key(self, public_key_or_point_bytes) -> bytes:
+        """
+        Performs ECDH: Returns x-coordinate of (MyPriv * InputPub).
+        Result is bytes.
+        """
+        if isinstance(public_key_or_point_bytes, bytes):
+            public_key = self._bytes_to_public_key(public_key_or_point_bytes)
+        else:
+            public_key = public_key_or_point_bytes
+            
+        shared_key = self.private_key.exchange(ec.ECDH(), public_key)
+        return shared_key
+
+    def _bytes_to_public_key(self, x_bytes: bytes) -> ec.EllipticCurvePublicKey:
+        """
+        Reconstructs a PublicKey from just the X-coordinate bytes.
+        Solves y^2 = x^3 + ax + b for y.
+        """
+        x = int.from_bytes(x_bytes, 'big')
+        rhs = (pow(x, 3, P) + A*x + B) % P
+        # Compute square root using Tonelli-Shanks or simple exponentiation if p = 3 mod 4
+        # P = 3 mod 4 for P-256.
+        y = pow(rhs, (P + 1) // 4, P)
+        
+        # Verify
+        if (y*y) % P != rhs:
+            raise ValueError("Point not on curve")
+            
+        public_numbers = ec.EllipticCurvePublicNumbers(x, y, self.curve)
+        return public_numbers.public_key(default_backend())
+
+    def serialize(self, val) -> bytes:
+        if isinstance(val, bytes):
+            return val
+        # If it's a public key object? No, we mostly pass bytes around after first step.
+        return pickle.dumps(val)
+        
+    def deserialize(self, data: bytes):
         return pickle.loads(data)
+
+class SecureAggregator:
+    def __init__(self):
+        pass
+        
+    @staticmethod
+    def create_context():
+        # CKKS for vector float operations
+        context = ts.context(
+            ts.SCHEME_TYPE.CKKS,
+            poly_modulus_degree=8192,
+            coeff_mod_bit_sizes=[60, 40, 40, 60]
+        )
+        context.global_scale = 2**40
+        context.generate_galois_keys()
+        return context
+        
+    @staticmethod
+    def encrypt_vector(context, vector: list):
+        return ts.ckks_vector(context, vector)
+        
+    @staticmethod
+    def deserialize_context(data: bytes):
+        return ts.context_from(data)
+        
+    @staticmethod
+    def deserialize_vector(context, data: bytes):
+        return ts.ckks_vector_from(context, data)

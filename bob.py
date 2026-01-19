@@ -1,12 +1,12 @@
 import socket
 import pandas as pd
-from psi_protocol import PSIProtocol
+from psi_protocol import PSIProtocol, SecureAggregator
 from data_generator import generate_data
 import network_utils
 from tqdm import tqdm
 import threading
 import time
-import phe.paillier as paillier
+import tenseal as ts
 
 class BobServer:
     def __init__(self, host='0.0.0.0', port=5000):
@@ -57,6 +57,8 @@ class BobServer:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 self.socket = s
+                # Allow address reuse
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 s.bind((self.host, self.port))
                 s.listen()
                 
@@ -87,16 +89,22 @@ class BobServer:
                 
                 if command == "PSI":
                     self.log(f"PSI Request from {addr}")
-                    alice_points = msg.get("points")
+                    alice_blinded = msg.get("points")
                     
-                    # Compute A^b
-                    alice_blinded_by_bob = [self.psi.blind_point(p) for p in alice_points]
+                    # Compute A^b (Alice's items blinded by Bob)
+                    alice_blinded_by_bob = []
+                    for p in alice_blinded:
+                         # p is x-coord bytes. Treat as PubKey.
+                         res = self.psi.apply_private_key(p)
+                         alice_blinded_by_bob.append(res)
+
                     network_utils.send_msg(conn, {"points": alice_blinded_by_bob})
                     
-                    # Send B = H(y)^b
+                    # Send B^b = H(y)^b
                     bob_ids = self.df_bob["ID"].tolist()
-                    bob_points = [self.psi.hash_to_point(uid) for uid in bob_ids]
-                    bob_blinded = [self.psi.blind_point(p) for p in bob_points]
+                    bob_points = [self.psi.hash_to_curve_public_key(uid) for uid in bob_ids]
+                    bob_blinded = [self.psi.apply_private_key(p) for p in bob_points]
+                    
                     network_utils.send_msg(conn, {"points": bob_blinded})
                     self.log(f"PSI Protocol completed for {addr}")
                     
@@ -110,53 +118,40 @@ class BobServer:
 
                 elif command == "SECURE_AGGREGATION":
                     self.log(f"SECURE_AGGREGATION Request from {addr}")
-                    # Receive public key and encrypted data
-                    pub_key_data = msg.get("public_key")
-                    public_key = paillier.PaillierPublicKey(n=pub_key_data['n'])
                     
-                    encrypted_salaries_data = msg.get("encrypted_salaries")
-                    # Reconstruct EncryptedNumber objects
-                    encrypted_salaries = {}
-                    for uid, enc_val in encrypted_salaries_data.items():
-                        encrypted_salaries[uid] = paillier.EncryptedNumber(public_key, int(enc_val))
+                    # Deserialize Context and Vector
+                    context = SecureAggregator.deserialize_context(msg.get("context"))
+                    enc_salaries = SecureAggregator.deserialize_vector(context, msg.get("enc_salaries"))
+                    ids = msg.get("ids") # Alignment list
                     
-                    self.log(f"Received {len(encrypted_salaries)} encrypted salaries.")
+                    self.log(f"Received encrypted salary vector size: {len(ids)}")
                     
-                    # Perform Homomorphic Addition: Enc(Salary) + Bonus
-                    # We need to match IDs.
-                    # df_bob has ID, Department, Bonus
+                    # Prepare Bob's Bonuses aligned
+                    bob_subset = self.df_bob[self.df_bob["ID"].isin(ids)].set_index("ID")
+                    bob_subset = bob_subset.reindex(ids)
+                    bonuses = bob_subset["Bonus"].tolist()
+                    departments = bob_subset["Department"].tolist()
                     
-                    # Filter Bob's data to only those in the encrypted list
-                    mask = self.df_bob["ID"].isin(encrypted_salaries.keys())
-                    bob_subset = self.df_bob[mask]
+                    # Homomorphic Addition: Enc(Salary) + Bonus
+                    enc_total = enc_salaries + bonuses
                     
-                    # Group by Department
-                    grouped_sums = {} # Department -> EncryptedSum
+                    # Aggregate by Department
+                    grouped_sums = {}
+                    unique_depts = set(departments)
                     
-                    count = 0
-                    for index, row in bob_subset.iterrows():
-                        uid = row["ID"]
-                        department = row["Department"]
-                        bonus = row["Bonus"]
-                        
-                        if uid in encrypted_salaries:
-                            enc_salary = encrypted_salaries[uid]
-                            # Homomorphic Addition: Enc(Salary) + Bonus
-                            enc_total = enc_salary + bonus
-                            
-                            if department not in grouped_sums:
-                                grouped_sums[department] = enc_total
-                            else:
-                                grouped_sums[department] = grouped_sums[department] + enc_total
-                            count += 1
-                            
-                    self.log(f"Aggregated {count} records into {len(grouped_sums)} departments.")
+                    for dept in unique_depts:
+                         # Create mask for this department
+                         mask = [1 if d == dept else 0 for d in departments]
+                         # Enc(Total) * Mask -> keeps only dept values, others 0
+                         # Sum() -> Sum of dept values
+                         enc_dept = enc_total * mask
+                         enc_dept_sum = enc_dept.sum()
+                         
+                         grouped_sums[dept] = enc_dept_sum.serialize()
+                         
+                    self.log(f"Aggregated records into {len(grouped_sums)} departments.")
                     
-                    # Serialize results
-                    # We send back the ciphertext (integer)
-                    serialized_results = {dept: str(enc_sum.ciphertext()) for dept, enc_sum in grouped_sums.items()}
-                    
-                    network_utils.send_msg(conn, {"results": serialized_results})
+                    network_utils.send_msg(conn, {"results": grouped_sums})
                     self.log("Sent aggregated results to Alice.")
                     
                 elif command == "EXIT":
@@ -165,6 +160,8 @@ class BobServer:
                     
         except Exception as e:
             self.log(f"Error handling client {addr}: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
             conn.close()
 
@@ -175,6 +172,9 @@ if __name__ == "__main__":
     server.start()
     try:
         while True:
+            # Keep main thread alive
             time.sleep(1)
+            if not server.running:
+                break
     except KeyboardInterrupt:
         server.stop()
